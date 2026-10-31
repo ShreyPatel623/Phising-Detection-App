@@ -1,7 +1,31 @@
 # Scamwise – Fraud & Phishing Detection (React + Vite)
 
 College project implementing the SRS "Fraud and Phishing Detection Mobile Application".
-Runs fully on-device: no backend, no API keys.
+
+Firebase Authentication manages accounts. Firestore stores a minimal scan-history summary per signed-in user. Detection itself remains on-device; the app does not upload full message text or scanned URLs.
+
+## Firebase setup
+
+1. In Firebase Console, open project `phishing-detection-app-fe4d4` (or your own project).
+2. Enable **Authentication → Sign-in method → Email/Password**.
+3. Create a **Cloud Firestore** database.
+4. Copy `.env.example` to `.env.local` and fill in the Web App configuration values from **Project settings → Your apps**. Do not commit `.env.local`.
+5. Install dependencies and start the app:
+
+   ```bash
+   npm install
+   npm run dev
+   ```
+6. Deploy the included Firestore rules:
+
+   ```bash
+   npm install -g firebase-tools
+   firebase login
+   firebase use phishing-detection-app-fe4d4
+   firebase deploy --only firestore:rules
+   ```
+
+Firebase Authentication accounts are cloud accounts and can sign in on multiple devices. Each user's scan summaries are stored under `users/{uid}/scans`. Only the authenticated owner can read or create their own scan documents. Scan content, message bodies, and full URLs are not uploaded. Existing local-only accounts are not automatically migrated; create a Firebase account and retain any local data you need to export before switching.
 
 ## Run it
 
@@ -11,7 +35,7 @@ npm run dev        # http://localhost:5173  (open on your phone with the Network
 npm test           # 138 tests: detection accuracy + login security (Node's built-in runner)
 npm run build      # production build in dist/
 ```
-Needs Node 18+. Camera QR scanning needs HTTPS or localhost.
+Needs Node 18+. Camera QR scanning needs HTTPS or localhost. Cloud sign-in and scan sync require an internet connection.
 
 ## Desktop (PC) app – Electron
 
