@@ -67,6 +67,11 @@ export function useStore(account) {
   const actions = useMemo(() => ({
     setSetting: (k, v) => commit(d => { d.settings[k] = v; }),
     record: res => { if (res.invalid) return; commit(d => { if (!d.settings.keepHistory) return; d.history.unshift({ id: res.id, ts: res.ts, channel: res.channel, preview: res.preview, score: res.score, label: res.label, signals: res.signals.slice(0, 6).map(({ t, lvl }) => ({ t, lvl })) }); d.history = d.history.slice(0, 300); }); },
+    mergeCloudHistory: rows => commit(d => {
+      const known = new Set(d.history.map(item => item.id));
+      const incoming = rows.filter(item => !known.has(item.id));
+      d.history = [...d.history, ...incoming].sort((a, b) => b.ts - a.ts).slice(0, 300);
+    }),
     addBlack: (type, v, source) => commit(d => addBlackD(d, type, v, source)),
     /** Block every link domain / phone number found in a scan result */
     blockFromResult: (r, source) => commit(d => { (r.urls || []).forEach(u => u.rd && !u.trusted && addBlackD(d, 'domain', u.rd, source)); if (r.entity) addBlackD(d, r.entityType, r.entity, source); }),
