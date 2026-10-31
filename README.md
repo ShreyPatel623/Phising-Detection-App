@@ -1,7 +1,31 @@
 # Scamwise – Fraud & Phishing Detection (React + Vite)
 
 College project implementing the SRS "Fraud and Phishing Detection Mobile Application".
-Runs fully on-device: no backend, no API keys.
+
+Firebase Authentication manages accounts. Firestore stores a minimal scan-history summary per signed-in user. Detection itself remains on-device; the app does not upload full message text or scanned URLs.
+
+## Firebase setup
+
+1. In Firebase Console, open project `phishing-detection-app-fe4d4` (or your own project).
+2. Enable **Authentication → Sign-in method → Email/Password**.
+3. Create a **Cloud Firestore** database.
+4. Copy `.env.example` to `.env.local` and fill in the Web App configuration values from **Project settings → Your apps**. Do not commit `.env.local`.
+5. Install dependencies and start the app:
+
+   ```bash
+   npm install
+   npm run dev
+   ```
+6. Deploy the included Firestore rules:
+
+   ```bash
+   npm install -g firebase-tools
+   firebase login
+   firebase use phishing-detection-app-fe4d4
+   firebase deploy --only firestore:rules
+   ```
+
+Firebase Authentication accounts are cloud accounts and can sign in on multiple devices. Each user's scan summaries are stored under `users/{uid}/scans`. Only the authenticated owner can read or create their own scan documents. Scan content, message bodies, and full URLs are not uploaded. Existing local-only accounts are not automatically migrated; create a Firebase account and retain any local data you need to export before switching.
 
 ## Run it
 
@@ -11,7 +35,7 @@ npm run dev        # http://localhost:5173  (open on your phone with the Network
 npm test           # 138 tests: detection accuracy + login security (Node's built-in runner)
 npm run build      # production build in dist/
 ```
-Needs Node 18+. Camera QR scanning needs HTTPS or localhost.
+Needs Node 18+. Camera QR scanning needs HTTPS or localhost. Cloud sign-in and scan sync require an internet connection.
 
 ## Desktop (PC) app – Electron
 
@@ -55,11 +79,11 @@ tests/engine.test.js    Unit tests for the engine
 
 ## Login
 
-Nothing in the app is reachable until you log in. Accounts are stored on the device only.
-Passwords are never saved, only a random salt and a PBKDF2-SHA256 hash. Five wrong
-passwords lock that email for 30 seconds. "Keep me logged in" keeps the session across
-restarts; without it the session ends when the tab/window closes. Each account has its
-own history, reports and lists.
+Nothing in the app is reachable until Firebase Authentication confirms the signed-in user.
+Email/password accounts are managed by Firebase. "Keep me logged in" persists the session
+on this device; without it the session ends with the browser session. Each account has its
+own local app data and a private Firestore scan-history collection. Passwords are never
+stored by Scamwise. Firebase handles password hashing and account security.
 
 ## Themes
 
@@ -97,7 +121,7 @@ To trust another site permanently, add its registered domain to `EXTRA_TRUSTED` 
 
 | SRS | Status |
 |---|---|
-| FR-1 Login | Implemented locally: sign up / log in / log out, change password, delete account, lockout after 5 failures. App is unreachable until logged in. Each account has its own data. No server (so no password recovery) |
+| FR-1 Login | Firebase Authentication: sign up / log in / log out, change password, delete account. App is gated by auth state. |
 | FR-2..FR-8 SMS, email, URL, QR, call, notification, ad | Implemented (manual / pasted / simulated input) |
 | FR-9 Risk scoring, FR-10 alerts | Implemented (rule-based, not TF Lite) |
 | FR-11/12 Reporting + community auto-block | Implemented locally (3 matching reports → blocklist) |
@@ -115,7 +139,7 @@ To trust another site permanently, add its registered domain to `EXTRA_TRUSTED` 
 * Detection is heuristic; there is no trained ML model and no measured accuracy. The test
   suite checks 60+ legitimate links/messages stay Safe and 30+ scams are still caught, but
   that is a regression suite, not a statistical accuracy figure.
-* Accounts are local to the device: no password recovery, no sync between devices.
+* Firebase Authentication requires internet access. The app's non-scan data (reports, custom lists, settings) remains local to each device; only scan-history summaries sync through Firestore.
 * No domain-age/SSL/Safe Browsing/VirusTotal checks (need a server to hold API keys).
 * Community reports come only from this device.
 
@@ -126,5 +150,4 @@ To trust another site permanently, add its registered domain to `EXTRA_TRUSTED` 
    then add native plugins for SMS / call screening / notification listener.
 2. **ML**: train a classifier on a public SMS-spam dataset in Python and add its
    probability as one more weighted signal in `engine/detection.js`.
-3. **Cloud**: Firebase Auth + Firestore for shared reports; a small function that
-   calls Safe Browsing / VirusTotal with server-side keys.
+3. **Cloud expansion**: add authenticated shared community reports and server-side URL reputation checks using Cloud Functions.
