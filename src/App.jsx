@@ -56,6 +56,14 @@ export default function App() {
 
 function Workspace({ account, auth, setAccount, logout }) {
   const { S, engine, actions } = useStore(account);
+  useEffect(() => {
+    if (!S.settings.keepHistory) return undefined;
+    let active = true;
+    auth.loadScans(account.id).then(rows => {
+      if (active && rows.length) actions.mergeCloudHistory(rows);
+    }).catch(error => console.error('Could not load cloud scan history:', error));
+    return () => { active = false; };
+  }, [auth, account.id, actions, S.settings.keepHistory]);
   const [nav, setNav] = useState({ route: 'home', sub: null });
   const [toasts, setToasts] = useState([]);
   const [banner, setBanner] = useState(null);
