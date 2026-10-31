@@ -1,141 +1,147 @@
-/**
- * Authentication (SRS FR-1) - local, on-device accounts.
- *
- * - Passwords are never stored. Only a random salt + a slow hash (PBKDF2-SHA256).
- *   If the browser has no WebCrypto (plain-http page opened over a LAN address) a
- *   salted, iterated SHA-256 fallback is used; the algorithm is saved with the account
- *   so both kinds keep working.
- * - 5 wrong passwords lock that email for 30 seconds.
- * - "Remember me" keeps the session in localStorage, otherwise in sessionStorage
- *   (cleared when the tab / window closes).
- * - Each account has its own data (history, reports, blocklist) under its own key.
- *
- * Honest limit: with no server, accounts exist only on this device and a forgotten
- * password cannot be recovered. A real deployment would use a backend (e.g. Firebase Auth).
- */
-const ACC = 'scamwise:accounts', SES = 'scamwise:session', LOCK = 'scamwise:lock';
-export const dataKey = id => 'scamwise:data:' + id;
-export const MAX_TRIES = 5, LOCK_MS = 30_000, MIN_PASSWORD = 8;
+import {
+  browserLocalPersistence, browserSessionPersistence, createUserWithEmailAndPassword,
+  deleteUser, EmailAuthProvider, onAuthStateChanged, reauthenticateWithCredential,
+  setPersistence, signInWithEmailAndPassword, signOut, updateEmail, updatePassword, updateProfile,
+} from 'firebase/auth';
+import { collection, deleteDoc, doc, getDoc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
+import { auth, db, firebaseConfigured } from './firebase.js';
 
-/* ---------- tiny pure-JS SHA-256 (fallback only) ---------- */
-const K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
-function sha256Bytes(msg) {
-  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
-  const l = msg.length, padded = new Uint8Array(((l + 9 + 63) >> 6) << 6);
-  padded.set(msg); padded[l] = 0x80;
-  const dv = new DataView(padded.buffer); dv.setUint32(padded.length - 4, (l * 8) >>> 0); dv.setUint32(padded.length - 8, Math.floor(l / 0x20000000));
-  let h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-  const w = new Uint32Array(64);
-  for (let o = 0; o < padded.length; o += 64) {
-    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
-    for (let i = 16; i < 64; i++) { const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3), s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10); w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0; }
-    let [a, b, c, d, e, f, g, hh] = h;
-    for (let i = 0; i < 64; i++) {
-      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g), t1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
-      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), mj = (a & b) ^ (a & c) ^ (b & c), t2 = (S0 + mj) >>> 0;
-      hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
-    }
-    h = [h[0] + a, h[1] + b, h[2] + c, h[3] + d, h[4] + e, h[5] + f, h[6] + g, h[7] + hh].map(x => x >>> 0);
-  }
-  const out = new Uint8Array(32); const o = new DataView(out.buffer); h.forEach((x, i) => o.setUint32(i * 4, x)); return out;
-}
-
-const enc = new TextEncoder();
-const toHex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
-const fromHex = h => Uint8Array.from(h.match(/../g) || [], x => parseInt(x, 16));
-const randomHex = n => { const a = new Uint8Array(n); (globalThis.crypto || {}).getRandomValues ? crypto.getRandomValues(a) : a.forEach((_, i) => (a[i] = Math.floor(Math.random() * 256))); return toHex(a); };
-const ALGO_SUBTLE = 'pbkdf2-sha256-150000', ALGO_JS = 'sha256-x20000';
-
-async function derive(password, saltHex, algo) {
-  if (algo === ALGO_SUBTLE) {
-    const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
-    return toHex(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: fromHex(saltHex), iterations: 150000 }, key, 256));
-  }
-  let h = sha256Bytes(new Uint8Array([...fromHex(saltHex), ...enc.encode(password)]));
-  for (let i = 0; i < 20000; i++) h = sha256Bytes(new Uint8Array([...h, ...enc.encode(password)]));
-  return toHex(h);
-}
-const bestAlgo = () => (globalThis.crypto && crypto.subtle ? ALGO_SUBTLE : ALGO_JS);
-const sameHex = (a, b) => { if (a.length !== b.length) return false; let r = 0; for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i); return r === 0; };
-
-/* ---------- validation helpers (exported for the UI) ---------- */
-export const validEmail = e => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
-/** 0 = too short, 1 = weak, 2 = fair, 3 = good, 4 = strong */
+export const MIN_PASSWORD = 8;
+export const validEmail = e => /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/.test(e);
 export function passwordStrength(p) {
   if (p.length < MIN_PASSWORD) return 0;
-  let s = 1; const kinds = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter(r => r.test(p)).length;
-  if (kinds >= 2) s++; if (kinds >= 3 && p.length >= 10) s++; if (kinds === 4 && p.length >= 12) s++;
+  let s = 1;
+  const kinds = [/[a-z]/, /[A-Z]/, /\\d/, /[^A-Za-z0-9]/].filter(r => r.test(p)).length;
+  if (kinds >= 2) s++;
+  if (kinds >= 3 && p.length >= 10) s++;
+  if (kinds === 4 && p.length >= 12) s++;
   if (/^(password|12345678|qwertyui|11111111)/i.test(p)) s = 1;
   return s;
 }
+const publicAccount = (user, profile = {}) => user ? ({
+  id: user.uid, name: profile.name || user.displayName || user.email?.split('@')[0] || 'Scamwise user',
+  email: user.email || '', country: profile.country || 'IN',
+  created: profile.createdAt?.toMillis?.() || Date.now(),
+}) : null;
 
-/** Create the auth API. Storage objects are injectable so it can be unit-tested in Node. */
-export function makeAuth(local = globalThis.localStorage, session = globalThis.sessionStorage) {
-  const read = (st, k, d) => { try { return JSON.parse(st.getItem(k)) ?? d; } catch { return d; } };
-  const write = (st, k, v) => { try { st.setItem(k, JSON.stringify(v)); } catch { /* storage full or blocked */ } };
-  const accounts = () => read(local, ACC, []);
-  const pub = a => (a ? { id: a.id, name: a.name, email: a.email, country: a.country, created: a.created } : null);
-  const norm = e => String(e || '').trim().toLowerCase();
+async function saveProfile(user, fields = {}) {
+  const ref = doc(db, 'users', user.uid);
+  const existing = await getDoc(ref);
+  const old = existing.exists() ? existing.data() : {};
+  const payload = {
+    uid: user.uid, email: user.email || '',
+    name: fields.name || user.displayName || old.name || 'Scamwise user',
+    country: fields.country || old.country || 'IN', updatedAt: serverTimestamp(),
+  };
+  if (!existing.exists()) payload.createdAt = serverTimestamp();
+  await setDoc(ref, payload, { merge: true });
+  return publicAccount(user, { ...old, ...payload });
+}
 
+export function makeAuth() {
   return {
-    accounts,
-    async signup({ name, email, password, country }) {
-      name = String(name || '').trim(); email = norm(email);
+    defaultMode: 'signup',
+    accounts: () => [],
+    observe(callback) {
+      if (!firebaseConfigured) { callback(null); return () => {}; }
+      return onAuthStateChanged(auth, async user => {
+        if (!user) return callback(null);
+        try {
+          const snap = await getDoc(doc(db, 'users', user.uid));
+          callback(publicAccount(user, snap.exists() ? snap.data() : {}));
+        } catch (error) {
+          console.error('Could not load Scamwise profile:', error);
+          callback(publicAccount(user));
+        }
+      });
+    },
+    async signup({ name, email, password, country }, remember = true) {
+      if (!firebaseConfigured) return { ok: false, error: 'Firebase is not configured. Add your Firebase values to .env.local and restart the app.' };
+      name = String(name || '').trim(); email = String(email || '').trim().toLowerCase();
       if (!name) return { ok: false, error: 'Enter your name.' };
       if (name.length > 60) return { ok: false, error: 'Name is too long.' };
       if (!validEmail(email)) return { ok: false, error: 'Enter a valid email address.' };
       if ((password || '').length < MIN_PASSWORD) return { ok: false, error: `Password must be at least ${MIN_PASSWORD} characters.` };
-      if (norm(password) === email) return { ok: false, error: 'Password cannot be the same as your email.' };
-      const list = accounts();
-      if (list.some(a => a.email === email)) return { ok: false, error: 'An account with this email already exists. Log in instead.' };
-      const algo = bestAlgo(), salt = randomHex(16);
-      const acc = { id: randomHex(8), name, email, country: country || 'IN', algo, salt, hash: await derive(password, salt, algo), created: Date.now() };
-      write(local, ACC, [...list, acc]);
-      return { ok: true, account: pub(acc) };
+      try {
+        await setPersistence(auth, remember ? browserLocalPersistence : browserSessionPersistence);
+        const credential = await createUserWithEmailAndPassword(auth, email, password);
+        await updateProfile(credential.user, { displayName: name });
+        const account = await saveProfile(credential.user, { name, country });
+        return { ok: true, account };
+      } catch (error) { return { ok: false, error: friendlyAuthError(error) }; }
     },
-
-    async login(email, password) {
-      email = norm(email);
-      const locks = read(local, LOCK, {}), lk = locks[email];
-      if (lk && lk.until > Date.now()) return { ok: false, error: `Too many attempts. Try again in ${Math.ceil((lk.until - Date.now()) / 1000)} seconds.`, locked: true };
-      const acc = accounts().find(a => a.email === email);
-      // Always do the slow hash, so an unknown email takes as long as a wrong password
-      const probe = await derive(password || '', acc ? acc.salt : '00'.repeat(16), acc ? acc.algo : bestAlgo());
-      if (acc && sameHex(probe, acc.hash)) { if (locks[email]) { delete locks[email]; write(local, LOCK, locks); } return { ok: true, account: pub(acc) }; }
-      const n = (lk && lk.until <= Date.now() && lk.n >= MAX_TRIES ? 0 : lk?.n || 0) + 1;
-      locks[email] = n >= MAX_TRIES ? { n, until: Date.now() + LOCK_MS } : { n, until: 0 };
-      write(local, LOCK, locks);
-      return { ok: false, error: n >= MAX_TRIES ? `Too many attempts. Try again in ${LOCK_MS / 1000} seconds.` : 'Incorrect email or password.', locked: n >= MAX_TRIES };
+    async login(email, password, remember = true) {
+      if (!firebaseConfigured) return { ok: false, error: 'Firebase is not configured. Add your Firebase values to .env.local and restart the app.' };
+      try {
+        await setPersistence(auth, remember ? browserLocalPersistence : browserSessionPersistence);
+        const credential = await signInWithEmailAndPassword(auth, String(email || '').trim().toLowerCase(), password || '');
+        const snap = await getDoc(doc(db, 'users', credential.user.uid));
+        const account = snap.exists() ? publicAccount(credential.user, snap.data()) : await saveProfile(credential.user);
+        return { ok: true, account };
+      } catch (error) { return { ok: false, error: friendlyAuthError(error) }; }
     },
-
-    getSession() {
-      const s = read(session, SES, null) || read(local, SES, null);
-      return s ? pub(accounts().find(a => a.id === s.id)) : null;
+    async clearSession() { await signOut(auth); },
+    async updateName(id, name) {
+      const user = auth.currentUser;
+      if (!user || user.uid !== id) return null;
+      name = String(name || '').trim().slice(0, 60);
+      if (!name) return null;
+      await updateProfile(user, { displayName: name });
+      return saveProfile(user, { name });
     },
-    setSession(id, remember) { this.clearSession(); write(remember ? local : session, SES, { id }); },
-    clearSession() { try { local.removeItem(SES); } catch { /* ignore */ } try { session.removeItem(SES); } catch { /* ignore */ } },
-
-    async changePassword(id, oldPw, newPw) {
-      const list = accounts(), acc = list.find(a => a.id === id);
-      if (!acc) return { ok: false, error: 'Account not found.' };
-      if (!sameHex(await derive(oldPw || '', acc.salt, acc.algo), acc.hash)) return { ok: false, error: 'Current password is incorrect.' };
-      if ((newPw || '').length < MIN_PASSWORD) return { ok: false, error: `New password must be at least ${MIN_PASSWORD} characters.` };
-      acc.algo = bestAlgo(); acc.salt = randomHex(16); acc.hash = await derive(newPw, acc.salt, acc.algo);
-      write(local, ACC, list); return { ok: true };
-    },
-    updateName(id, name) {
-      const list = accounts(), acc = list.find(a => a.id === id); if (!acc) return null;
-      acc.name = String(name || '').trim().slice(0, 60) || acc.name; write(local, ACC, list); return pub(acc);
+    async changePassword(id, oldPassword, newPassword) {
+      const user = auth.currentUser;
+      if (!user || user.uid !== id) return { ok: false, error: 'Please log in again.' };
+      if ((newPassword || '').length < MIN_PASSWORD) return { ok: false, error: `New password must be at least ${MIN_PASSWORD} characters.` };
+      try {
+        await reauthenticateWithCredential(user, EmailAuthProvider.credential(user.email, oldPassword || ''));
+        await updatePassword(user, newPassword);
+        return { ok: true };
+      } catch (error) { return { ok: false, error: friendlyAuthError(error) }; }
     },
     async deleteAccount(id, password) {
-      const list = accounts(), acc = list.find(a => a.id === id);
-      if (!acc) return { ok: false, error: 'Account not found.' };
-      if (!sameHex(await derive(password || '', acc.salt, acc.algo), acc.hash)) return { ok: false, error: 'Password is incorrect.' };
-      write(local, ACC, list.filter(a => a.id !== id)); try { local.removeItem(dataKey(id)); } catch { /* ignore */ }
-      this.clearSession(); return { ok: true };
+      const user = auth.currentUser;
+      if (!user || user.uid !== id) return { ok: false, error: 'Please log in again.' };
+      try {
+        await reauthenticateWithCredential(user, EmailAuthProvider.credential(user.email, password || ''));
+        const scans = await getDocs(collection(db, 'users', id, 'scans'));
+        for (let i = 0; i < scans.docs.length; i += 400) {
+          const batch = writeBatch(db);
+          scans.docs.slice(i, i + 400).forEach(scan => batch.delete(scan.ref));
+          await batch.commit();
+        }
+        await deleteDoc(doc(db, 'users', id));
+        await deleteUser(user);
+        return { ok: true };
+      } catch (error) { return { ok: false, error: friendlyAuthError(error) }; }
+    },
+    async saveScan(result, userId) {
+      if (!firebaseConfigured || !auth.currentUser || auth.currentUser.uid !== userId || result.invalid) return;
+      const signals = (result.signals || []).slice(0, 6).map(s => ({
+        text: String(s.t || '').slice(0, 240), level: String(s.lvl || '').slice(0, 24),
+      }));
+      await setDoc(doc(db, 'users', userId, 'scans', String(result.id)), {
+        channel: String(result.channel || 'unknown').slice(0, 24),
+        score: Math.max(0, Math.min(100, Number(result.score) || 0)),
+        label: ['Safe', 'Suspicious', 'Dangerous'].includes(result.label) ? result.label : 'Suspicious',
+        signals, createdAt: serverTimestamp(), scannedAt: Number(result.ts) || Date.now(),
+      });
     },
   };
 }
 
-/** exported only so the unit tests can check the fallback hash against Node's crypto */
-export const _sha256Hex = s => toHex(sha256Bytes(enc.encode(s)));
+function friendlyAuthError(error) {
+  const messages = {
+    'auth/email-already-in-use': 'An account with this email already exists. Log in instead.',
+    'auth/invalid-email': 'Enter a valid email address.',
+    'auth/invalid-credential': 'Incorrect email or password.',
+    'auth/user-not-found': 'No account was found for this email.',
+    'auth/wrong-password': 'Incorrect email or password.',
+    'auth/weak-password': 'Choose a stronger password (at least 8 characters).',
+    'auth/too-many-requests': 'Too many attempts. Please wait and try again.',
+    'auth/requires-recent-login': 'Please log in again before doing this.',
+    'auth/network-request-failed': 'Network error. Check your internet connection.',
+    'permission-denied': 'Firebase denied this operation. Check that Firestore rules are deployed.',
+  };
+  return messages[error?.code] || error?.message || 'Something went wrong. Please try again.';
+}
