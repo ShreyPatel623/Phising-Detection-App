@@ -3,7 +3,7 @@ import {
   deleteUser, EmailAuthProvider, onAuthStateChanged, reauthenticateWithCredential,
   setPersistence, signInWithEmailAndPassword, signOut, updateEmail, updatePassword, updateProfile,
 } from 'firebase/auth';
-import { collection, deleteDoc, doc, getDoc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocs, limit, orderBy, query, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
 import { auth, db, firebaseConfigured } from './firebase.js';
 
 export const MIN_PASSWORD = 8;
@@ -111,9 +111,19 @@ export function makeAuth() {
           await batch.commit();
         }
         await deleteDoc(doc(db, 'users', id));
+        try { localStorage.removeItem('scamwise:data:' + id); } catch { /* storage may be unavailable */ }
         await deleteUser(user);
         return { ok: true };
       } catch (error) { return { ok: false, error: friendlyAuthError(error) }; }
+    },
+    async loadScans(userId) {
+      if (!firebaseConfigured || !auth.currentUser || auth.currentUser.uid !== userId) return [];
+      const q = query(collection(db, 'users', userId, 'scans'), orderBy('scannedAt', 'desc'), limit(300));
+      const snap = await getDocs(q);
+      return snap.docs.map(item => {
+        const data = item.data();
+        return { id: item.id, ts: Number(data.scannedAt) || Date.now(), channel: data.channel || 'unknown', preview: 'Cloud scan', score: data.score || 0, label: data.label || 'Suspicious', signals: (data.signals || []).map(s => ({ t: s.text || '', lvl: s.level || 'info' })) };
+      });
     },
     async saveScan(result, userId) {
       if (!firebaseConfigured || !auth.currentUser || auth.currentUser.uid !== userId || result.invalid) return;
