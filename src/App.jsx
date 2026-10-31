@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo } from 'react';
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { useStore } from './store.js';
 import { makeAuth } from './auth.js';
 import { useThemeState } from './theme.js';
@@ -19,17 +19,30 @@ const NAV = [['home', 'Home'], ['scan', 'Scan'], ['history', 'History'], ['learn
 const PAGES = { home: Home, scan: Scan, history: History, learn: Learn, more: More };
 const Logo = () => <span className="logo"><Icon name="shield" />Scamwise</span>;
 
-/** Root: owns the theme and the login gate. Nothing else renders until someone is logged in. */
 export default function App() {
   const theme = useThemeState();
   const auth = useMemo(() => makeAuth(), []);
-  const [account, setAccount] = useState(() => auth.getSession());
-  const logout = useCallback(() => { auth.clearSession(); setAccount(null); window.scrollTo(0, 0); }, [auth]);
-  const login = (acc, remember) => { auth.setSession(acc.id, remember); setAccount(acc); };
+  const [account, setAccount] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  useEffect(() => auth.observe(user => {
+    setAccount(user);
+    setAuthReady(true);
+  }), [auth]);
+
+  const logout = useCallback(async () => {
+    try { await auth.clearSession(); }
+    catch (error) { console.error('Logout failed:', error); }
+    window.scrollTo(0, 0);
+  }, [auth]);
+
+  const login = acc => setAccount(acc);
 
   return (
     <ThemeCtx.Provider value={theme}>
-      {account ? (
+      {!authReady ? (
+        <div id="app"><header className="top"><Logo /></header><main id="view"><p className="muted">Connecting to Scamwise…</p></main></div>
+      ) : account ? (
         <Workspace key={account.id} account={account} auth={auth} setAccount={setAccount} logout={logout} />
       ) : (
         <div id="app">
@@ -41,28 +54,32 @@ export default function App() {
   );
 }
 
-/** Everything a logged-in user sees. Remounted per account, so data never leaks between users. */
 function Workspace({ account, auth, setAccount, logout }) {
   const { S, engine, actions } = useStore(account);
   const [nav, setNav] = useState({ route: 'home', sub: null });
   const [toasts, setToasts] = useState([]);
   const [banner, setBanner] = useState(null);
   const [alert, setAlert] = useState(null);
-  const results = useRef({});   // scan results of this session (full detail, not persisted)
-  const demoIdx = useRef(0);    // cycles through the sample inputs
+  const results = useRef({});
+  const demoIdx = useRef(0);
 
   const go = useCallback((route, sub = null) => { setNav({ route, sub }); window.scrollTo(0, 0); }, []);
   const toast = useCallback((m, ms = 2600) => { const id = uid(); setToasts(t => [...t, { id, m }]); setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), ms); }, []);
-  const record = useCallback(r => { results.current[r.id] = r; actions.record(r); }, [actions]);
+  const record = useCallback(r => {
+    results.current[r.id] = r;
+    actions.record(r);
+    if (S.settings.keepHistory) auth.saveScan(r, account.id).catch(error => {
+      console.error('Could not sync scan to Firestore:', error);
+      toast('Scan saved on this device; cloud sync failed.');
+    });
+  }, [actions, S.settings.keepHistory, auth, account.id, toast]);
 
-  /** Account actions used by Settings */
   const accountApi = useMemo(() => ({
-    updateName: name => { const a = auth.updateName(account.id, name); if (a) setAccount(a); },
+    updateName: async name => { const a = await auth.updateName(account.id, name); if (a) setAccount(a); },
     changePassword: (oldPw, newPw) => auth.changePassword(account.id, oldPw, newPw),
-    deleteAccount: async pw => { const r = await auth.deleteAccount(account.id, pw); if (r.ok) logout(); return r; },
+    deleteAccount: async pw => { const r = await auth.deleteAccount(account.id, pw); if (r.ok) await logout(); return r; },
   }), [auth, account.id, setAccount, logout]);
 
-  /** Live demo of real-time protection (FR-10): incoming item -> scan -> alert */
   const simulate = useCallback(() => {
     const s = SAMPLES[demoIdx.current++ % SAMPLES.length];
     const run = {
@@ -90,22 +107,16 @@ function Workspace({ account, auth, setAccount, logout }) {
       <div id="app" className="has-nav">
         <header className="top">
           <Logo />
-          <div className="right">
-            <button className="sos" onClick={() => go('more', 'emergency')}>Been scammed?</button>
-            <ThemeToggle />
-          </div>
+          <div className="right"><button className="sos" onClick={() => go('more', 'emergency')}>Been scammed?</button><ThemeToggle /></div>
         </header>
         <main id="view" aria-live="polite"><Page /></main>
         <nav className="nav" aria-label="Main">
           {NAV.map(([k, l]) => <button key={k} onClick={() => go(k)} aria-current={nav.route === k ? 'page' : undefined}><Icon name={k} />{l}</button>)}
         </nav>
       </div>
-
       {banner && <div className="banner" role="status"><b>{banner}</b><div className="small muted">Scanning…</div></div>}
-      {alert && (
-        <AlertOverlay r={alert.r} who={alert.who} onClose={() => setAlert(null)}
-          onReport={() => { actions.submitReport(alert.r.channel, alert.r.input || alert.r.preview, 'Blocked by live alert'); actions.blockFromResult(alert.r, 'user-feedback'); setAlert(null); toast('Blocked and reported.'); }} />
-      )}
+      {alert && <AlertOverlay r={alert.r} who={alert.who} onClose={() => setAlert(null)}
+        onReport={() => { actions.submitReport(alert.r.channel, alert.r.input || alert.r.preview, 'Blocked by live alert'); actions.blockFromResult(alert.r, 'user-feedback'); setAlert(null); toast('Blocked and reported.'); }} />}
       {toasts.slice(-1).map(t => <div key={t.id} className="toast" role="status">{t.m}</div>)}
     </AppCtx.Provider>
   );
